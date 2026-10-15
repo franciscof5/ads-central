@@ -1,0 +1,1 @@
+(this.$WP=this.$WP||[]).push(["-2hM2s",(e,t)=>{"use strict";var r,n,s=()=>{var{locale:e}=r(n);return"en-US"===e.code};return[()=>{e("default",s)},[e=>r=e.useContext,e=>n=e.Environment]]},["cDcdfi","2R4xv2"]]);

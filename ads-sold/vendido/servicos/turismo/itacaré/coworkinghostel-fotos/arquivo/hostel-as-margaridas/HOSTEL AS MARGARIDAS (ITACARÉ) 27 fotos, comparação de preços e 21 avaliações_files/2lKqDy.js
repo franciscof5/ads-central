@@ -1,0 +1,1 @@
+(this.$WP=this.$WP||[]).push(["2lKqDy",(t,e)=>{"use strict";var i,a,l;return[()=>{l=i(t=>({url:t.meta.initialAbsoluteUrl,itemType:t.meta.initialServletName,itemId:t.page.detailId||"0"}))(a),t("default",l)},[t=>i=t.connect,t=>a=t.ShareCta]]},["h74DsO","ui0Mdg"]]);

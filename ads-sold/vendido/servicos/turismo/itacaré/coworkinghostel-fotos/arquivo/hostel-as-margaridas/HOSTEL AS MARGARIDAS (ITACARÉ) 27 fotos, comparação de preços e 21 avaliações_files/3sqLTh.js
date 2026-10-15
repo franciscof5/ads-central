@@ -1,0 +1,1 @@
+(this.$WP=this.$WP||[]).push(["3sqLTh",(P,s)=>{"use strict";var t={NAME:"name",PHOTO:"photo",REVIEWS:"reviews"},e={POPUP:"popup",CARD:"card"};return[()=>{P("default",t),P({CLICK_SOURCES:t,MAP_LISTING_TYPES:e})},[]]},[]]);

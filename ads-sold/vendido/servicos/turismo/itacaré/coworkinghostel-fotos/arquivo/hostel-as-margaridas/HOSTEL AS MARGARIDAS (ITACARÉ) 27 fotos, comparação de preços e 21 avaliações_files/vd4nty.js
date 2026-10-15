@@ -1,0 +1,1 @@
+(this.$WP=this.$WP||[]).push(["vd4nty",(t,e)=>{"use strict";var r,s=({x:t,y:e,children:s})=>r("div",{style:{transform:`translate(${t}px, ${e}px)`}},s);return[()=>{s.defaultProps={x:0,y:0},t("default",s)},[t=>r=t.createElement]]},["cDcdfi"]]);

@@ -1,0 +1,1 @@
+(this.$WP=this.$WP||[]).push(["roCOIO",(e,a)=>{"use strict";var s,c,l=e=>s("div",{className:c("FvPuYHkq",e.className)},e.children),i=({active:e,elementType:a="span",onClick:l,className:i,children:r})=>s(a,{onClick:l,className:c("_2GIfqQkr",i,{sLZhlLAo:e})},r);return[()=>{e({GroupingTab:i,GroupingTabs:l})},[e=>s=e.createElement,e=>c=e.default]]},["cDcdfi","jSLlaY"]]);

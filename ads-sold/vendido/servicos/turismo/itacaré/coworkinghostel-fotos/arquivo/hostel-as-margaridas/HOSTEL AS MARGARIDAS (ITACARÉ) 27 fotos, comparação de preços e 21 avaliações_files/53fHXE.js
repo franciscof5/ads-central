@@ -1,0 +1,1 @@
+(this.$WP=this.$WP||[]).push(["53fHXE",(e,s)=>{"use strict";var a,t,l=({items:e=[]})=>a("span",{className:"Yx05notv"},e.length?e.map(e=>a("span",{className:"_2ESCcCP9",key:`${e.id}-${e.name||""}`},e.value)):a("span",null,a(t,{id:"CRITERIA_ANY"})));return[()=>{l.defaultProps={items:[]},e("default",l)},[e=>a=e.createElement,e=>t=e.default]]},["cDcdfi","0DsHEV"]]);

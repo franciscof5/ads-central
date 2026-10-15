@@ -1,0 +1,1 @@
+(this.$WP=this.$WP||[]).push(["-i3PJS",(e,t)=>{"use strict";var a,s,r=e=>{Object.entries(e).forEach(([e,t])=>{s[e]=t})},u=e=>!!s[e];return[()=>{s=Object.assign({},a),e("default",{featureIsEnabled:u}),e({featureIsEnabled:u,loadFeatures:r})},[e=>a=e.default]]},["@ta/features"]]);
