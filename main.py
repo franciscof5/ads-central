@@ -13,6 +13,8 @@ import gzip
 import time
 import tempfile
 import zipfile
+import subprocess
+import threading
 
 app = FastAPI(title="F5 Sites Anúncios")
 
@@ -114,6 +116,15 @@ DESTINOS_MOVER = {
 }
 
 # ============================================================
+# GIT (auto-commit + push a cada alteração)
+# ============================================================
+GIT_AUTOCOMMIT = os.environ.get("GIT_AUTOCOMMIT", "1").lower() not in ("0", "false", "no", "")
+GIT_REMOTE = os.environ.get("GIT_REMOTE", "origin")
+GIT_BRANCH = os.environ.get("GIT_BRANCH", "main")
+GIT_TIMEOUT = int(os.environ.get("GIT_TIMEOUT", "120"))
+_git_lock = threading.Lock()
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -170,6 +181,56 @@ def escanear_categoria(cat_slug):
         })
 
     return produtos
+
+
+def _git(args, timeout=None):
+    """Executa um comando git no repositório do projeto."""
+    timeout = timeout or GIT_TIMEOUT
+    cmd = ["git", "-c", "safe.directory=*"]
+    usuario = os.environ.get("GIT_USER_NAME")
+    email = os.environ.get("GIT_USER_EMAIL")
+    if usuario:
+        cmd += ["-c", f"user.name={usuario}", "-c", f"user.email={email or usuario}"]
+    cmd += ["-C", str(BASE_DIR), *args]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def git_commit_push(mensagem):
+    """Faz add/commit/push de todas as alterações. Nunca lança exceção."""
+    if not GIT_AUTOCOMMIT:
+        return {"ok": False, "motivo": "auto-commit desativado"}
+    with _git_lock:
+        try:
+            add = _git(["add", "-A"])
+            if add.returncode != 0:
+                erro = (add.stderr or add.stdout).strip()
+                print(f"[git] add falhou: {erro}", flush=True)
+                return {"ok": False, "erro": erro}
+
+            status = _git(["status", "--porcelain"])
+            if not status.stdout.strip():
+                return {"ok": True, "commit": False, "push": False, "motivo": "nada para commitar"}
+
+            commit = _git(["commit", "-m", mensagem])
+            if commit.returncode != 0:
+                erro = (commit.stderr or commit.stdout).strip()
+                print(f"[git] commit falhou: {erro}", flush=True)
+                return {"ok": False, "commit": False, "erro": erro}
+
+            push = _git(["push", GIT_REMOTE, GIT_BRANCH])
+            if push.returncode != 0:
+                erro = (push.stderr or push.stdout).strip()
+                print(f"[git] push falhou ({GIT_REMOTE} {GIT_BRANCH}): {erro}", flush=True)
+                return {"ok": False, "commit": True, "push": False, "erro": erro}
+
+            print(f"[git] commit + push ok: {mensagem}", flush=True)
+            return {"ok": True, "commit": True, "push": True}
+        except subprocess.TimeoutExpired:
+            print("[git] timeout ao executar git", flush=True)
+            return {"ok": False, "erro": "timeout ao executar git"}
+        except Exception as e:
+            print(f"[git] erro inesperado: {e}", flush=True)
+            return {"ok": False, "erro": str(e)}
 
 
 # ============================================================
@@ -237,6 +298,33 @@ def status(request: Request):
     return {"autenticado": tem_acesso_vendidos(request)}
 
 
+@app.get("/api/git-status")
+def git_status(request: Request):
+    """Diagnóstico do auto-commit/push. Requer senha."""
+    if not tem_acesso_vendidos(request):
+        raise HTTPException(status_code=401, detail="Área restrita. Informe a senha.")
+
+    def rodar(args):
+        try:
+            r = _git(args, timeout=40)
+            return {"code": r.returncode, "out": r.stdout.strip(), "err": r.stderr.strip()}
+        except Exception as e:
+            return {"code": -1, "out": "", "err": str(e)}
+
+    return {
+        "autocommit": GIT_AUTOCOMMIT,
+        "remote": GIT_REMOTE,
+        "branch": GIT_BRANCH,
+        "cwd": str(BASE_DIR),
+        "usuario": os.environ.get("GIT_USER_NAME") or "(git config)",
+        "rev_parse": rodar(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "remotes": rodar(["remote", "-v"]),
+        "status": rodar(["status", "--porcelain"]),
+        "last_commit": rodar(["log", "-1", "--oneline"]),
+        "push_dry_run": rodar(["push", "--dry-run", GIT_REMOTE, GIT_BRANCH]),
+    }
+
+
 @app.post("/api/mover")
 def mover_produto(payload: dict):
     """
@@ -261,7 +349,10 @@ def mover_produto(payload: dict):
     
     shutil.move(str(origem), str(destino_final))
     
-    return {"ok": True, "origem": str(origem.relative_to(BASE_DIR)), "destino": str(destino_final.relative_to(BASE_DIR))}
+    origem_rel = str(origem.relative_to(BASE_DIR))
+    destino_rel = str(destino_final.relative_to(BASE_DIR))
+    git = git_commit_push(f"Mover anúncio: {origem_rel} -> {destino_rel}")
+    return {"ok": True, "origem": origem_rel, "destino": destino_rel, "git": git}
 
 
 # ============================================================
@@ -293,6 +384,7 @@ async def adicionar_produto(tipo: str, nome: str, request: Request):
 
     # Recebe o corpo em streaming para um arquivo temporário (não estoura a memória)
     tam = 0
+    resultado = None
     tmp = tempfile.NamedTemporaryFile(suffix='.zip', dir=str(BASE_DIR), delete=False)
     try:
         async for chunk in request.stream():
@@ -340,12 +432,16 @@ async def adicionar_produto(tipo: str, nome: str, request: Request):
                 pass
             raise HTTPException(status_code=400, detail="Nenhuma imagem encontrada no ZIP")
 
-        return {"ok": True, "destino": str(destino.relative_to(BASE_DIR)), "arquivos": extraidos}
+        resultado = {"ok": True, "destino": str(destino.relative_to(BASE_DIR)), "arquivos": extraidos}
     finally:
         try:
             os.remove(tmp.name)
         except OSError:
             pass
+
+    git = git_commit_push(f"Adicionar anúncio: {resultado['destino']}")
+    resultado["git"] = git
+    return resultado
 
 
 @app.post("/api/excluir")
@@ -363,7 +459,9 @@ def excluir_produto(payload: dict, request: Request):
     if not alvo.is_dir():
         raise HTTPException(status_code=404, detail="Pasta não encontrada")
     shutil.rmtree(alvo)
-    return {"ok": True, "removido": str(alvo.relative_to(BASE_DIR.resolve()))}
+    removido = str(alvo.relative_to(BASE_DIR.resolve()))
+    git = git_commit_push(f"Excluir anúncio: {removido}")
+    return {"ok": True, "removido": removido, "git": git}
 
 
 # ============================================================
@@ -728,7 +826,7 @@ async function mover(event, origem, destino) {
     });
     const data = await res.json();
     if (data.ok) {
-      showToast('✓ Item movido com sucesso! Recarregando...');
+      showToast('✓ Item movido com sucesso!' + gitResumo(data.git) + ' Recarregando...');
       setTimeout(() => carregarProdutos(), 1000);
     } else {
       throw new Error(data.detail || 'Erro ao mover');
@@ -750,7 +848,7 @@ async function excluirProduto(pasta, nome) {
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.ok) {
-      showToast('🗑 Item excluído! Recarregando...');
+      showToast('🗑 Item excluído!' + gitResumo(data.git) + ' Recarregando...');
       setTimeout(() => carregarProdutos(), 800);
     } else {
       showToast('✗ ' + (data.detail || 'Erro ao excluir'), true);
@@ -766,13 +864,21 @@ document.addEventListener('click', (e) => {
   e.preventDefault();
   e.stopPropagation();
   excluirProduto(btn.dataset.excluir, btn.dataset.nome);
-});
+}, true);
 
 function showToast(msg, isError) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.className = 'toast' + (isError ? ' error' : '') + ' show';
   setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+function gitResumo(g) {
+  if (!g) return '';
+  if (g.ok && g.push) return ' · git ✓ enviado';
+  if (g.ok && !g.commit) return ' · git: nada a enviar';
+  if (g.ok && g.commit && !g.push) return ' · git: commit local (push falhou)';
+  return ' · git ✗ ' + (g.erro || g.motivo || 'falhou');
 }
 
 function setCategoria(cat) {
@@ -958,7 +1064,7 @@ async function enviarAdicionar() {
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.ok) {
       fecharAdicionar();
-      showToast(`✓ Anúncio adicionado (${data.arquivos} arquivos)`);
+      showToast(`✓ Anúncio adicionado (${data.arquivos} arquivos)` + gitResumo(data.git));
       categoriaAtiva = tipo;
       document.querySelectorAll('nav button:not(.btn-logout)').forEach(b => b.classList.remove('active'));
       const alvo = document.getElementById('btn-' + tipo);
