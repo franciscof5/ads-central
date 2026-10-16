@@ -10,6 +10,9 @@ import hmac
 import hashlib
 import os
 import gzip
+import time
+import tempfile
+import zipfile
 
 app = FastAPI(title="F5 Sites Anúncios")
 
@@ -262,6 +265,90 @@ def mover_produto(payload: dict):
 
 
 # ============================================================
+# ADICIONAR ANÚNCIO (ZIP com fotos) — requer senha
+# ============================================================
+
+ARQUIVOS_PERMITIDOS = IMAGENS_EXT | {'.txt'}
+MAX_ZIP_BYTES = 300 * 1024 * 1024
+MAX_EXTRAIDO_BYTES = 1024 * 1024 * 1024
+
+
+@app.post("/api/adicionar")
+async def adicionar_produto(tipo: str, nome: str, request: Request):
+    """Cria um novo anúncio a partir de um ZIP com as fotos. Requer senha."""
+    if not tem_acesso_vendidos(request):
+        raise HTTPException(status_code=401, detail="Área restrita. Informe a senha.")
+    if tipo not in CATEGORIAS:
+        raise HTTPException(status_code=400, detail="Tipo inválido")
+
+    nome = (nome or "").strip().replace('/', '-').replace('\\', '-').lstrip('.')
+    if not nome:
+        raise HTTPException(status_code=400, detail="Informe o nome do anúncio")
+
+    base = BASE_DIR / CATEGORIAS[tipo]['dir']
+    base.mkdir(parents=True, exist_ok=True)
+    destino = base / nome
+    if destino.exists():
+        destino = base / f"{nome}_{int(time.time())}"
+
+    # Recebe o corpo em streaming para um arquivo temporário (não estoura a memória)
+    tam = 0
+    tmp = tempfile.NamedTemporaryFile(suffix='.zip', dir=str(BASE_DIR), delete=False)
+    try:
+        async for chunk in request.stream():
+            tam += len(chunk)
+            if tam > MAX_ZIP_BYTES:
+                raise HTTPException(status_code=413, detail="ZIP muito grande (máx 300MB)")
+            tmp.write(chunk)
+        tmp.close()
+
+        if tam == 0:
+            raise HTTPException(status_code=400, detail="Arquivo ZIP vazio")
+
+        try:
+            zf = zipfile.ZipFile(tmp.name)
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="Arquivo não é um ZIP válido")
+
+        destino.mkdir(parents=True, exist_ok=True)
+        extraidos = 0
+        total = 0
+        with zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                arquivo = os.path.basename(info.filename)  # achata subpastas + evita path traversal
+                if not arquivo or arquivo.startswith('.'):
+                    continue
+                ext = Path(arquivo).suffix.lower()
+                if ext not in ARQUIVOS_PERMITIDOS:
+                    continue
+                total += info.file_size
+                if total > MAX_EXTRAIDO_BYTES:
+                    raise HTTPException(status_code=413, detail="Conteúdo extraído muito grande")
+                alvo = destino / arquivo
+                if alvo.exists():
+                    alvo = destino / f"{Path(arquivo).stem}_{extraidos}{ext}"
+                with zf.open(info) as src, open(alvo, 'wb') as out:
+                    shutil.copyfileobj(src, out, length=1024 * 1024)
+                extraidos += 1
+
+        if extraidos == 0:
+            try:
+                destino.rmdir()
+            except OSError:
+                pass
+            raise HTTPException(status_code=400, detail="Nenhuma imagem encontrada no ZIP")
+
+        return {"ok": True, "destino": str(destino.relative_to(BASE_DIR)), "arquivos": extraidos}
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+
+
+# ============================================================
 # SERVIR IMAGENS ESTATICAS DAS PASTAS REAIS
 # ============================================================
 
@@ -441,6 +528,24 @@ nav button.desbloqueado .lock { color: var(--accent); }
 .pw-btn-cancelar { background: var(--surface-hover); color: var(--text-muted);
   border: 1px solid var(--border) !important; }
 .pw-btn-cancelar:hover { color: var(--text); }
+
+/* Formulário de adicionar */
+.pw-box.add-box { text-align: left; max-width: 440px; }
+.add-box h3, .add-box p { text-align: center; }
+.add-box label { display: block; font-size: 0.8rem; color: var(--text-muted);
+  margin: 0.7rem 0 0.3rem; }
+.add-box select, .add-box input[type=text], .add-box input[type=file] {
+  width: 100%; padding: 0.7rem; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); font-family: inherit; font-size: 0.9rem; }
+.add-box select:focus, .add-box input:focus { outline: none; border-color: var(--accent); }
+.add-box .pw-actions { margin-top: 1.2rem; }
+
+/* Cabeçalho: título + botão adicionar */
+.header-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+.btn-adicionar { padding: 0.6rem 1.2rem; border-radius: 8px; border: 1px solid var(--accent);
+  background: rgba(0, 212, 170, 0.08); color: var(--accent); font-weight: 700; font-size: 0.85rem;
+  font-family: inherit; cursor: pointer; transition: all 0.2s; white-space: nowrap; flex-shrink: 0; }
+.btn-adicionar:hover { background: var(--accent); color: var(--bg); }
 
 .btn-logout { background: none; border: 1px solid var(--border); color: var(--text-muted);
   padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; font-size: 0.8rem;
@@ -628,7 +733,10 @@ function setCategoria(cat) {
 }
 
 // ===== SENHA =====
-function abrirSenha(msg) {
+let acaoAposLogin = null;
+
+function abrirSenha(msg, aoEntrar) {
+  acaoAposLogin = aoEntrar || null;
   const overlay = document.getElementById('pw-overlay');
   document.getElementById('pw-msg').textContent = msg || 'Digite a senha para visualizar.';
   document.getElementById('pw-erro').style.display = 'none';
@@ -639,6 +747,7 @@ function abrirSenha(msg) {
 
 function fecharSenha() {
   document.getElementById('pw-overlay').classList.remove('active');
+  acaoAposLogin = null;
 }
 
 async function fazerLogin() {
@@ -653,10 +762,14 @@ async function fazerLogin() {
       body: JSON.stringify({senha})
     });
     if (res.ok) {
+      const cb = acaoAposLogin;
+      acaoAposLogin = null;
       fecharSenha();
       autenticado = true;
+      atualizarNav();
       showToast('🔓 Acesso liberado!');
       await carregarProdutos();
+      if (cb) cb();
     } else {
       erro.textContent = 'Senha incorreta. Tente novamente.';
       erro.style.display = 'block';
@@ -666,6 +779,67 @@ async function fazerLogin() {
   } catch (err) {
     erro.textContent = 'Erro ao conectar. Tente novamente.';
     erro.style.display = 'block';
+  }
+}
+
+// ===== ADICIONAR ANÚNCIO =====
+function abrirAdicionar() {
+  if (!autenticado) {
+    abrirSenha('Área restrita. Digite a senha para adicionar.', abrirAdicionar);
+    return;
+  }
+  document.getElementById('add-erro').style.display = 'none';
+  document.getElementById('add-nome').value = '';
+  document.getElementById('add-zip').value = '';
+  document.getElementById('add-overlay').classList.add('active');
+  setTimeout(() => document.getElementById('add-nome').focus(), 100);
+}
+
+function fecharAdicionar() {
+  document.getElementById('add-overlay').classList.remove('active');
+}
+
+async function enviarAdicionar() {
+  const tipo = document.getElementById('add-tipo').value;
+  const nome = document.getElementById('add-nome').value.trim();
+  const arquivo = document.getElementById('add-zip').files[0];
+  const erro = document.getElementById('add-erro');
+  const btn = document.getElementById('add-enviar');
+
+  if (!nome) { erro.textContent = 'Informe o nome do anúncio.'; erro.style.display = 'block'; return; }
+  if (!arquivo) { erro.textContent = 'Selecione um arquivo .zip com as fotos.'; erro.style.display = 'block'; return; }
+
+  erro.style.display = 'none';
+  btn.disabled = true;
+  const rotulo = btn.textContent;
+  btn.textContent = 'Enviando...';
+
+  try {
+    const url = `/api/adicionar?tipo=${encodeURIComponent(tipo)}&nome=${encodeURIComponent(nome)}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/zip'},
+      body: arquivo
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      fecharAdicionar();
+      showToast(`✓ Anúncio adicionado (${data.arquivos} arquivos)`);
+      categoriaAtiva = tipo;
+      document.querySelectorAll('nav button:not(.btn-logout)').forEach(b => b.classList.remove('active'));
+      const alvo = document.getElementById('btn-' + tipo);
+      if (alvo) alvo.classList.add('active');
+      await carregarProdutos();
+    } else {
+      erro.textContent = data.detail || 'Erro ao enviar o anúncio.';
+      erro.style.display = 'block';
+    }
+  } catch (e) {
+    erro.textContent = 'Falha de conexão ao enviar.';
+    erro.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = rotulo;
   }
 }
 
@@ -727,8 +901,13 @@ HTML = f"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>F5 Sites Anúncios</h1>
-  <p>Catálogo de produtos, serviços e itens vendidos</p>
+  <div class="header-top">
+    <div>
+      <h1>F5 Sites Anúncios</h1>
+      <p>Catálogo de produtos, serviços e itens vendidos</p>
+    </div>
+    <button id="btn-adicionar" class="btn-adicionar" onclick="abrirAdicionar()">➕ Adicionar</button>
+  </div>
   <nav>
     <button id="btn-todos" onclick="setCategoria('todos')">Todos</button>
     <button id="btn-classificados" class="active" onclick="setCategoria('classificados')">Classificados</button>
@@ -755,6 +934,28 @@ HTML = f"""<!DOCTYPE html>
     <div class="pw-actions">
       <button class="pw-btn-cancelar" onclick="fecharSenha()">Cancelar</button>
       <button class="pw-btn-entrar" onclick="fazerLogin()">Entrar</button>
+    </div>
+  </div>
+</div>
+
+<div class="pw-overlay" id="add-overlay">
+  <div class="pw-box add-box">
+    <h3>Adicionar anúncio</h3>
+    <p>Escolha o tipo e envie um ZIP com as fotos.</p>
+    <label>Tipo</label>
+    <select id="add-tipo">
+      <option value="classificados">Classificado</option>
+      <option value="fabricado">Fabricado</option>
+      <option value="sold">Vendido</option>
+    </select>
+    <label>Nome do anúncio</label>
+    <input type="text" id="add-nome" placeholder="Ex: Bicicleta Caloi Aro 26">
+    <label>Fotos (.zip)</label>
+    <input type="file" id="add-zip" accept=".zip,application/zip">
+    <div class="pw-erro" id="add-erro"></div>
+    <div class="pw-actions">
+      <button class="pw-btn-cancelar" onclick="fecharAdicionar()">Cancelar</button>
+      <button class="pw-btn-entrar" id="add-enviar" onclick="enviarAdicionar()">Enviar</button>
     </div>
   </div>
 </div>
