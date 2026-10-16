@@ -208,23 +208,24 @@ def git_commit_push(mensagem):
                 return {"ok": False, "erro": erro}
 
             status = _git(["status", "--porcelain"])
-            if not status.stdout.strip():
-                return {"ok": True, "commit": False, "push": False, "motivo": "nada para commitar"}
+            commitou = bool(status.stdout.strip())
 
-            commit = _git(["commit", "-m", mensagem])
-            if commit.returncode != 0:
-                erro = (commit.stderr or commit.stdout).strip()
-                print(f"[git] commit falhou: {erro}", flush=True)
-                return {"ok": False, "commit": False, "erro": erro}
+            if commitou:
+                commit = _git(["commit", "-m", mensagem])
+                if commit.returncode != 0:
+                    erro = (commit.stderr or commit.stdout).strip()
+                    print(f"[git] commit falhou: {erro}", flush=True)
+                    return {"ok": False, "commit": False, "erro": erro}
 
+            # Sempre tenta o push (envia também commits pendentes de push)
             push = _git(["push", GIT_REMOTE, GIT_BRANCH])
             if push.returncode != 0:
                 erro = (push.stderr or push.stdout).strip()
                 print(f"[git] push falhou ({GIT_REMOTE} {GIT_BRANCH}): {erro}", flush=True)
-                return {"ok": False, "commit": True, "push": False, "erro": erro}
+                return {"ok": False, "commit": commitou, "push": False, "erro": erro}
 
-            print(f"[git] commit + push ok: {mensagem}", flush=True)
-            return {"ok": True, "commit": True, "push": True}
+            print(f"[git] commit={commitou} + push ok: {mensagem}", flush=True)
+            return {"ok": True, "commit": commitou, "push": True}
         except subprocess.TimeoutExpired:
             print("[git] timeout ao executar git", flush=True)
             return {"ok": False, "erro": "timeout ao executar git"}
