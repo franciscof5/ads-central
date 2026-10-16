@@ -753,10 +753,12 @@ function renderCard(p) {
   const imgUrl = `/imagem/${p.categoria}/${p.slug}/${encodeURIComponent(p.imagem_capa)}?v=${p.versao}`;
   const botoes = [];
   
-  if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
-  if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
-  if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
-  if (autenticado) botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
+  if (autenticado) {
+    if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
+    if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
+    if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
+    botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
+  }
 
   return `
 <div class="card" onclick="abrirDetalhe('${p.categoria}', '${p.slug}')">
@@ -786,10 +788,12 @@ function abrirDetalhe(categoria, slug) {
   ).join('');
 
   const botoes = [];
-  if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
-  if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
-  if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
-  if (autenticado) botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
+  if (autenticado) {
+    if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
+    if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
+    if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
+    botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
+  }
 
   const desc = p.descricao ? `<pre>${p.descricao}</pre>` : '<p class="desc-text" style="color: var(--text-muted)">Sem descrição detalhada.</p>';
 
