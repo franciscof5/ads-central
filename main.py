@@ -2,12 +2,14 @@ from fastapi import FastAPI, HTTPException, Request, Cookie, Response
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import Headers, MutableHeaders
 from pathlib import Path
 import shutil
 import unicodedata
 import hmac
 import hashlib
 import os
+import gzip
 
 app = FastAPI(title="F5 Sites Anúncios")
 
@@ -18,6 +20,67 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Tipos de conteúdo que valem a pena comprimir (imagens/arquivos já são comprimidos)
+COMPRESSIVEIS = ("text/html", "application/json", "text/css",
+                 "application/javascript", "text/plain", "image/svg+xml")
+
+
+class GzipSeletivoMiddleware:
+    """Gzip puro-ASGI que só comprime tipos textuais (nunca imagens/binários)."""
+
+    def __init__(self, app, minimum_size=500, compresslevel=6):
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or "gzip" not in Headers(scope=scope).get("accept-encoding", ""):
+            await self.app(scope, receive, send)
+            return
+
+        estado = {"passar": False, "start": None, "partes": []}
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = Headers(raw=message["headers"])
+                ctype = headers.get("content-type", "")
+                if "content-encoding" in headers or not ctype.startswith(COMPRESSIVEIS):
+                    estado["passar"] = True
+                    await send(message)
+                else:
+                    estado["start"] = message
+            elif message["type"] == "http.response.body":
+                if estado["passar"]:
+                    await send(message)
+                    return
+                estado["partes"].append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    corpo = b"".join(estado["partes"])
+                    if len(corpo) >= self.minimum_size:
+                        comprimido = gzip.compress(corpo, self.compresslevel)
+                        if len(comprimido) < len(corpo):
+                            headers = MutableHeaders(raw=estado["start"]["headers"])
+                            headers.add_vary_header("Accept-Encoding")
+                            headers["Content-Encoding"] = "gzip"
+                            headers["Content-Length"] = str(len(comprimido))
+                            corpo = comprimido
+                    await send(estado["start"])
+                    await send({"type": "http.response.body", "body": corpo, "more_body": False})
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.add_middleware(GzipSeletivoMiddleware)
+
+
+@app.middleware("http")
+async def cache_api(request: Request, call_next):
+    response = await call_next(request)
+    # API sempre fresca (dados dinâmicos)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 BASE_DIR = Path(__file__).parent
 IMAGENS_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.bmp'}
@@ -72,9 +135,16 @@ def escanear_categoria(cat_slug):
 
         imagens = []
         descricao = ""
+        versao = 0
         for arquivo in pasta.iterdir():
             if arquivo.suffix.lower() in IMAGENS_EXT:
                 imagens.append(arquivo.name)
+                try:
+                    mt = int(arquivo.stat().st_mtime)
+                    if mt > versao:
+                        versao = mt
+                except OSError:
+                    pass
             elif arquivo.suffix.lower() == '.txt':
                 try:
                     descricao = arquivo.read_text(encoding='utf-8')
@@ -93,6 +163,7 @@ def escanear_categoria(cat_slug):
             'descricao': descricao,
             'pasta_relativa': str(pasta.relative_to(BASE_DIR)),
             'imagem_capa': sorted(imagens)[0],
+            'versao': versao,
         })
 
     return produtos
@@ -164,14 +235,11 @@ def status(request: Request):
 
 
 @app.post("/api/mover")
-def mover_produto(payload: dict, request: Request):
+def mover_produto(payload: dict):
     """
-    Move uma pasta de produto entre categorias.
+    Move uma pasta de produto entre categorias (sem exigir senha).
     Body: {"origem": "ads-classificados/Nome Produto", "destino": "ads-sold/vendido"}
     """
-    if not tem_acesso_vendidos(request):
-        raise HTTPException(status_code=401, detail="Acesso restrito. Informe a senha.")
-
     origem = BASE_DIR / payload.get('origem', '')
     destino_dir = BASE_DIR / payload.get('destino', '')
     
@@ -208,12 +276,16 @@ def servir_imagem(categoria: str, slug: str, filename: str, request: Request):
     # Encontra a pasta real pelo slug
     cfg = CATEGORIAS[categoria]
     caminho_base = BASE_DIR / cfg['dir']
-    
+
+    # Imagens de vendidos ficam em cache privado; as demais, público e imutável
+    escopo = "private" if categoria == 'sold' else "public"
+    headers_cache = {"Cache-Control": f"{escopo}, max-age=31536000, immutable"}
+
     for pasta in caminho_base.iterdir():
         if pasta.is_dir() and slugify(pasta.name) == slug:
             img_path = pasta / filename
             if img_path.exists():
-                return FileResponse(str(img_path))
+                return FileResponse(str(img_path), headers=headers_cache)
             break
     
     raise HTTPException(status_code=404, detail="Imagem não encontrada")
@@ -385,7 +457,7 @@ nav button.desbloqueado .lock { color: var(--accent); }
 
 JS = """
 let produtos = [];
-let categoriaAtiva = 'todos';
+let categoriaAtiva = 'classificados';
 let autenticado = false;
 
 // ===== WHATSAPP =====
@@ -449,7 +521,7 @@ function renderizar() {
 }
 
 function renderCard(p) {
-  const imgUrl = `/imagem/${p.categoria}/${p.slug}/${encodeURIComponent(p.imagem_capa)}`;
+  const imgUrl = `/imagem/${p.categoria}/${p.slug}/${encodeURIComponent(p.imagem_capa)}?v=${p.versao}`;
   const botoes = [];
   
   if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
@@ -480,7 +552,7 @@ function abrirDetalhe(categoria, slug) {
   if (!p) return;
 
   const imagens = p.imagens.map((img, i) => 
-    `<div class="gallery-item"><img src="/imagem/${p.categoria}/${p.slug}/${encodeURIComponent(img)}" alt="Foto ${i+1}" loading="lazy"></div>`
+    `<div class="gallery-item"><img src="/imagem/${p.categoria}/${p.slug}/${encodeURIComponent(img)}?v=${p.versao}" alt="Foto ${i+1}" loading="lazy"></div>`
   ).join('');
 
   const botoes = [];
@@ -523,12 +595,6 @@ async function mover(event, origem, destino) {
       body: JSON.stringify({origem, destino})
     });
     const data = await res.json();
-    if (res.status === 401) {
-      btn.disabled = false;
-      btn.textContent = textoOriginal;
-      abrirSenha('Para mover itens é preciso estar autenticado.');
-      return;
-    }
     if (data.ok) {
       showToast('✓ Item movido com sucesso! Recarregando...');
       setTimeout(() => carregarProdutos(), 1000);
@@ -606,9 +672,9 @@ async function fazerLogin() {
 async function logout() {
   await fetch('/api/logout', {method: 'POST'});
   autenticado = false;
-  categoriaAtiva = 'todos';
+  categoriaAtiva = 'classificados';
   document.querySelectorAll('nav button:not(.btn-logout)').forEach(b => b.classList.remove('active'));
-  document.getElementById('btn-todos').classList.add('active');
+  document.getElementById('btn-classificados').classList.add('active');
   showToast('🔒 Sessão encerrada');
   await carregarProdutos();
   window.scrollTo({top: 0, behavior: 'smooth'});
@@ -664,8 +730,8 @@ HTML = f"""<!DOCTYPE html>
   <h1>F5 Sites Anúncios</h1>
   <p>Catálogo de produtos, serviços e itens vendidos</p>
   <nav>
-    <button id="btn-todos" class="active" onclick="setCategoria('todos')">Todos</button>
-    <button id="btn-classificados" onclick="setCategoria('classificados')">Classificados</button>
+    <button id="btn-todos" onclick="setCategoria('todos')">Todos</button>
+    <button id="btn-classificados" class="active" onclick="setCategoria('classificados')">Classificados</button>
     <button id="btn-fabricado" onclick="setCategoria('fabricado')">Fabricados</button>
     <button id="btn-sold" onclick="setCategoria('sold')">Vendidos <span class="lock">🔒</span></button>
     <button id="btn-logout" class="btn-logout" style="display:none;margin-left:auto;" onclick="logout()">Sair</button>
@@ -699,7 +765,7 @@ HTML = f"""<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse(content=HTML)
+    return HTMLResponse(content=HTML, headers={"Cache-Control": "no-cache"})
 
 
 # ============================================================
