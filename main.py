@@ -348,6 +348,24 @@ async def adicionar_produto(tipo: str, nome: str, request: Request):
             pass
 
 
+@app.post("/api/excluir")
+def excluir_produto(payload: dict, request: Request):
+    """Exclui a pasta de um anúncio. Requer senha."""
+    if not tem_acesso_vendidos(request):
+        raise HTTPException(status_code=401, detail="Área restrita. Informe a senha.")
+    raizes = [(BASE_DIR / cfg['dir']).resolve() for cfg in CATEGORIAS.values()]
+    try:
+        alvo = (BASE_DIR / payload.get('pasta', '')).resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Caminho inválido")
+    if not any(c in alvo.parents for c in raizes):
+        raise HTTPException(status_code=400, detail="Caminho inválido")
+    if not alvo.is_dir():
+        raise HTTPException(status_code=404, detail="Pasta não encontrada")
+    shutil.rmtree(alvo)
+    return {"ok": True, "removido": str(alvo.relative_to(BASE_DIR.resolve()))}
+
+
 # ============================================================
 # SERVIR IMAGENS ESTATICAS DAS PASTAS REAIS
 # ============================================================
@@ -440,6 +458,8 @@ nav button.active { color: var(--accent); border-color: var(--accent);
   color: var(--text-muted); cursor: pointer; transition: all 0.2s; font-family: inherit; }
 .btn-action:hover { border-color: var(--accent); color: var(--accent); background: rgba(0,212,170,0.08); }
 .btn-action.danger:hover { border-color: var(--danger); color: var(--danger); background: rgba(239,68,68,0.08); }
+.btn-action.excluir { border-color: rgba(239,68,68,0.45); color: var(--danger); margin-left: auto; }
+.btn-action.excluir:hover { border-color: var(--danger); color: #fff; background: var(--danger); }
 .btn-action:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Botão WhatsApp */
@@ -560,7 +580,7 @@ nav button.desbloqueado .lock { color: var(--accent); }
 }
 """
 
-JS = """
+JS = r"""
 let produtos = [];
 let categoriaAtiva = 'classificados';
 let autenticado = false;
@@ -572,6 +592,11 @@ const WA_ICON = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" ari
 function linkWhatsApp(nome) {
   const msg = 'Estou interessado: ' + nome;
   return 'https://wa.me/' + WHATSAPP_NUM + '?text=' + encodeURIComponent(msg);
+}
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 async function carregarProdutos() {
@@ -632,6 +657,7 @@ function renderCard(p) {
   if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
   if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
   if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
+  if (autenticado) botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
 
   return `
 <div class="card" onclick="abrirDetalhe('${p.categoria}', '${p.slug}')">
@@ -664,6 +690,7 @@ function abrirDetalhe(categoria, slug) {
   if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
   if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
   if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
+  if (autenticado) botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
 
   const desc = p.descricao ? `<pre>${p.descricao}</pre>` : '<p class="desc-text" style="color: var(--text-muted)">Sem descrição detalhada.</p>';
 
@@ -712,6 +739,34 @@ async function mover(event, origem, destino) {
     btn.textContent = textoOriginal;
   }
 }
+
+async function excluirProduto(pasta, nome) {
+  if (!confirm('Excluir "' + nome + '"?\n\nEssa ação não pode ser desfeita.')) return;
+  try {
+    const res = await fetch('/api/excluir', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pasta})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      showToast('🗑 Item excluído! Recarregando...');
+      setTimeout(() => carregarProdutos(), 800);
+    } else {
+      showToast('✗ ' + (data.detail || 'Erro ao excluir'), true);
+    }
+  } catch (err) {
+    showToast('✗ Falha de conexão', true);
+  }
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-excluir]');
+  if (!btn) return;
+  e.preventDefault();
+  e.stopPropagation();
+  excluirProduto(btn.dataset.excluir, btn.dataset.nome);
+});
 
 function showToast(msg, isError) {
   const t = document.getElementById('toast');
@@ -790,7 +845,7 @@ function abrirAdicionar() {
   }
   document.getElementById('add-erro').style.display = 'none';
   document.getElementById('add-nome').value = '';
-  document.getElementById('add-zip').value = '';
+  document.getElementById('add-fotos').value = '';
   document.getElementById('add-overlay').classList.add('active');
   setTimeout(() => document.getElementById('add-nome').focus(), 100);
 }
@@ -799,15 +854,94 @@ function fecharAdicionar() {
   document.getElementById('add-overlay').classList.remove('active');
 }
 
+// ===== ZIP no navegador (método "stored", sem biblioteca) =====
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+async function criarZip(files) {
+  const enc = new TextEncoder();
+  const partes = [];
+  const centrais = [];
+  let offset = 0;
+  for (const f of files) {
+    const nomeBytes = enc.encode(f.name);
+    const dados = new Uint8Array(await f.arrayBuffer());
+    const crc = crc32(dados);
+
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true);
+    lh.setUint16(4, 20, true);
+    lh.setUint16(6, 0x0800, true);   // UTF-8
+    lh.setUint16(8, 0, true);        // stored
+    lh.setUint32(14, crc, true);
+    lh.setUint32(18, dados.length, true);
+    lh.setUint32(22, dados.length, true);
+    lh.setUint16(26, nomeBytes.length, true);
+    partes.push(new Uint8Array(lh.buffer), nomeBytes, dados);
+
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true);
+    cd.setUint16(4, 20, true);
+    cd.setUint16(6, 20, true);
+    cd.setUint16(8, 0x0800, true);
+    cd.setUint16(10, 0, true);
+    cd.setUint32(16, crc, true);
+    cd.setUint32(20, dados.length, true);
+    cd.setUint32(24, dados.length, true);
+    cd.setUint16(28, nomeBytes.length, true);
+    cd.setUint32(42, offset, true);
+    centrais.push(new Uint8Array(cd.buffer), nomeBytes);
+
+    offset += 30 + nomeBytes.length + dados.length;
+  }
+  const cdSize = centrais.reduce((a, b) => a + b.length, 0);
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0, 0x06054b50, true);
+  eocd.setUint16(8, files.length, true);
+  eocd.setUint16(10, files.length, true);
+  eocd.setUint32(12, cdSize, true);
+  eocd.setUint32(16, offset, true);
+  partes.push(...centrais, new Uint8Array(eocd.buffer));
+  return new Blob(partes, {type: 'application/zip'});
+}
+
 async function enviarAdicionar() {
   const tipo = document.getElementById('add-tipo').value;
   const nome = document.getElementById('add-nome').value.trim();
-  const arquivo = document.getElementById('add-zip').files[0];
+  const files = Array.from(document.getElementById('add-fotos').files);
   const erro = document.getElementById('add-erro');
   const btn = document.getElementById('add-enviar');
 
   if (!nome) { erro.textContent = 'Informe o nome do anúncio.'; erro.style.display = 'block'; return; }
-  if (!arquivo) { erro.textContent = 'Selecione um arquivo .zip com as fotos.'; erro.style.display = 'block'; return; }
+  if (files.length === 0) { erro.textContent = 'Selecione fotos ou um arquivo .zip.'; erro.style.display = 'block'; return; }
+
+  // Se for um único .zip, envia direto; senão, monta um zip com as fotos
+  let corpo;
+  if (files.length === 1 && files[0].name.toLowerCase().endsWith('.zip')) {
+    corpo = files[0];
+  } else {
+    const ok = /\.(jpe?g|png|webp|gif|avif|bmp)$/i;
+    const invalidos = files.filter(f => !ok.test(f.name)).map(f => f.name);
+    if (invalidos.length) {
+      erro.textContent = 'Só imagens ou um .zip. Inválido: ' + invalidos.join(', ');
+      erro.style.display = 'block';
+      return;
+    }
+    corpo = await criarZip(files);
+  }
 
   erro.style.display = 'none';
   btn.disabled = true;
@@ -819,7 +953,7 @@ async function enviarAdicionar() {
     const res = await fetch(url, {
       method: 'POST',
       headers: {'Content-Type': 'application/zip'},
-      body: arquivo
+      body: corpo
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.ok) {
@@ -950,8 +1084,8 @@ HTML = f"""<!DOCTYPE html>
     </select>
     <label>Nome do anúncio</label>
     <input type="text" id="add-nome" placeholder="Ex: Bicicleta Caloi Aro 26">
-    <label>Fotos (.zip)</label>
-    <input type="file" id="add-zip" accept=".zip,application/zip">
+    <label>Fotos (imagens ou um .zip)</label>
+    <input type="file" id="add-fotos" accept=".zip,image/*" multiple>
     <div class="pw-erro" id="add-erro"></div>
     <div class="pw-actions">
       <button class="pw-btn-cancelar" onclick="fecharAdicionar()">Cancelar</button>
