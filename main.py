@@ -106,12 +106,14 @@ def tem_acesso_vendidos(request: Request) -> bool:
 CATEGORIAS = {
     'classificados': {'dir': 'ads-classificados', 'nome': 'Classificado'},
     'fabricado':     {'dir': 'ads-fabricado',     'nome': 'Fabricado'},
+    'revenda':       {'dir': 'ads-revenda',       'nome': 'Revenda'},
     'sold':          {'dir': 'ads-sold/vendido',  'nome': 'Vendido'},
 }
 
 DESTINOS_MOVER = {
     'classificados': 'ads-classificados',
     'fabricado':     'ads-fabricado',
+    'revenda':       'ads-revenda',
     'sold':          'ads-sold/vendido',
 }
 
@@ -549,6 +551,7 @@ nav button.active { color: var(--accent); border-color: var(--accent);
   font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
 .badge-classificados { background: rgba(0,212,170,0.15); color: var(--accent); }
 .badge-fabricado { background: rgba(124,58,237,0.15); color: #a78bfa; }
+.badge-revenda { background: rgba(245,158,11,0.15); color: #fbbf24; }
 .badge-sold { background: rgba(239,68,68,0.15); color: var(--danger); }
 .card-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: auto;
   padding-top: 0.8rem; border-top: 1px solid var(--border); }
@@ -732,11 +735,11 @@ function renderizar() {
   });
 
   let html = '';
-  const ordem = ['classificados', 'fabricado', 'sold'];
+  const ordem = ['classificados', 'fabricado', 'revenda', 'sold'];
   
   ordem.forEach(cat => {
     if (!grupos[cat]) return;
-    const cfg = {classificados: 'Classificados', fabricado: 'Produtos & Serviços Próprios', sold: 'Itens Vendidos'}[cat];
+    const cfg = {classificados: 'Classificados', fabricado: 'Produtos & Serviços Próprios', revenda: 'Produtos para Revenda', sold: 'Itens Vendidos'}[cat];
     html += `<section id="${cat}"><h2 class="section-title">${cfg} (${grupos[cat].length})</h2><div class="grid">`;
     html += grupos[cat].map(p => renderCard(p)).join('');
     html += '</div></section>';
@@ -756,6 +759,7 @@ function renderCard(p) {
   if (autenticado) {
     if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
     if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
+    if (p.categoria !== 'revenda') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-revenda')">→ Revenda</button>`);
     if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
     botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
   }
@@ -791,6 +795,7 @@ function abrirDetalhe(categoria, slug) {
   if (autenticado) {
     if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
     if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
+    if (p.categoria !== 'revenda') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-revenda')">→ Revenda</button>`);
     if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
     botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
   }
@@ -1157,6 +1162,7 @@ HTML = f"""<!DOCTYPE html>
     <button id="btn-todos" onclick="setCategoria('todos')">Todos</button>
     <button id="btn-classificados" class="active" onclick="setCategoria('classificados')">Classificados</button>
     <button id="btn-fabricado" onclick="setCategoria('fabricado')">Fabricados</button>
+    <button id="btn-revenda" onclick="setCategoria('revenda')">Revenda</button>
     <button id="btn-sold" onclick="setCategoria('sold')">Vendidos <span class="lock">🔒</span></button>
     <button id="btn-logout" class="btn-logout" style="display:none;margin-left:auto;" onclick="logout()">Sair</button>
   </nav>
@@ -1191,6 +1197,7 @@ HTML = f"""<!DOCTYPE html>
     <select id="add-tipo">
       <option value="classificados">Classificado</option>
       <option value="fabricado">Fabricado</option>
+      <option value="revenda">Revenda</option>
       <option value="sold">Vendido</option>
     </select>
     <label>Nome do anúncio</label>
