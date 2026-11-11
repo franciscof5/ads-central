@@ -16,6 +16,10 @@ import zipfile
 import subprocess
 import threading
 
+import pocketbase
+import setup_pocketbase
+import sync_meta
+
 app = FastAPI(title="F5 Sites Anúncios")
 
 # Permissões CORS (para desenvolvimento local)
@@ -138,6 +142,91 @@ def slugify(text):
     return text[:80]
 
 
+_meta_cache = {"ts": 0.0, "produtos": ({}, {}), "locais": ({}, []), "erro": None}
+_meta_lock = threading.Lock()
+META_TTL = int(os.environ.get("POCKETBASE_CACHE_TTL", "30"))
+
+
+def _invalidar_meta():
+    with _meta_lock:
+        _meta_cache["ts"] = 0.0
+
+
+def _dados_pocketbase(forcar=False):
+    if not pocketbase.configurado():
+        with _meta_lock:
+            _meta_cache["erro"] = "PocketBase não configurado (POCKETBASE_EMAIL/POCKETBASE_PASSWORD)"
+        return {}, {}, {}, []
+    agora = time.time()
+    with _meta_lock:
+        if not forcar and agora - _meta_cache["ts"] < META_TTL:
+            por_id, por_folder = _meta_cache["produtos"]
+            locais_por_id, locais = _meta_cache["locais"]
+            return por_id, por_folder, locais_por_id, locais
+    try:
+        registros = pocketbase.listar_todos()
+        locais = pocketbase.localizacoes()
+    except Exception as erro:
+        print(f"[pocketbase] {erro}", flush=True)
+        with _meta_lock:
+            _meta_cache["ts"] = agora
+            _meta_cache["erro"] = str(erro)
+        return {}, {}, {}, []
+    por_id = {r["id"]: r for r in registros}
+    por_folder = {r.get("folder"): r for r in registros if r.get("folder")}
+    locais_por_id = {l["id"]: l for l in locais}
+    with _meta_lock:
+        _meta_cache["ts"] = agora
+        _meta_cache["produtos"] = (por_id, por_folder)
+        _meta_cache["locais"] = (locais_por_id, locais)
+        _meta_cache["erro"] = None
+    return por_id, por_folder, locais_por_id, locais
+
+
+def _caminho_localizacao(loc_id, locais_por_id):
+    caminho = []
+    atual = locais_por_id.get(loc_id) if loc_id else None
+    vistos = set()
+    raiz_id = None
+    while atual and atual["id"] not in vistos:
+        vistos.add(atual["id"])
+        caminho.append(atual.get("name", ""))
+        raiz_id = atual["id"]
+        pai = atual.get("parent") or ""
+        atual = locais_por_id.get(pai) if pai else None
+    caminho.reverse()
+    return caminho, raiz_id
+
+
+def _registro_do_produto(produto, por_id, por_folder):
+    pasta = BASE_DIR / produto["pasta_relativa"]
+    meta_id = sync_meta.produto_id(pasta)
+    registro = por_id.get(meta_id) if meta_id else None
+    if not registro:
+        registro = por_folder.get(produto["pasta_relativa"])
+    dados = (registro or {}).get("data") or {}
+    if not isinstance(dados, dict):
+        dados = {}
+    return registro, dados
+
+
+def _enriquecer_produtos(produtos, admin):
+    por_id, por_folder, locais_por_id, _ = _dados_pocketbase()
+    for produto in produtos:
+        registro, dados = _registro_do_produto(produto, por_id, por_folder)
+        produto["meta_id"] = registro["id"] if registro else None
+        produto["price"] = dados.get("price")
+        if admin:
+            loc_id = dados.get("location") or dados.get("address")
+            caminho, raiz_id = _caminho_localizacao(loc_id, locais_por_id)
+            produto["meta"] = dados
+            produto["address"] = caminho[0] if caminho else None
+            produto["location"] = caminho[1:] if len(caminho) > 1 else []
+            produto["location_id"] = loc_id
+            produto["address_id"] = raiz_id
+    return produtos
+
+
 def escanear_categoria(cat_slug):
     cfg = CATEGORIAS[cat_slug]
     caminho = BASE_DIR / cfg['dir']
@@ -249,6 +338,7 @@ def listar_produtos(request: Request):
         if slug == 'sold' and not acesso:
             continue
         todos.extend(escanear_categoria(slug))
+    _enriquecer_produtos(todos, acesso)
     return {"produtos": todos, "total": len(todos), "autenticado": acesso}
 
 
@@ -256,9 +346,10 @@ def listar_produtos(request: Request):
 def listar_por_categoria(categoria: str, request: Request):
     if categoria not in CATEGORIAS:
         raise HTTPException(status_code=404, detail="Categoria não encontrada")
-    if categoria == 'sold' and not tem_acesso_vendidos(request):
+    acesso = tem_acesso_vendidos(request)
+    if categoria == 'sold' and not acesso:
         raise HTTPException(status_code=401, detail="Seção de vendidos protegida por senha")
-    produtos = escanear_categoria(categoria)
+    produtos = _enriquecer_produtos(escanear_categoria(categoria), acesso)
     return {"produtos": produtos, "total": len(produtos)}
 
 
@@ -269,10 +360,247 @@ def detalhe_produto(categoria: str, slug: str, request: Request):
     if categoria == 'sold' and not tem_acesso_vendidos(request):
         raise HTTPException(status_code=401, detail="Seção de vendidos protegida por senha")
 
+    acesso = tem_acesso_vendidos(request)
     for p in escanear_categoria(categoria):
         if p['slug'] == slug:
-            return p
+            return _enriquecer_produtos([p], acesso)[0]
     raise HTTPException(status_code=404, detail="Produto não encontrado")
+
+
+def _exigir_admin(request: Request):
+    if not tem_acesso_vendidos(request):
+        raise HTTPException(status_code=401, detail="Área restrita. Informe a senha.")
+
+
+def _pb_erro(erro):
+    print(f"[pocketbase] {erro}", flush=True)
+    return HTTPException(status_code=502, detail=str(erro))
+
+
+@app.get("/api/pocketbase/status")
+def pocketbase_status(request: Request):
+    _exigir_admin(request)
+    info = {
+        "configurado": pocketbase.configurado(),
+        "url": pocketbase.BASE_URL,
+        "health": pocketbase.disponivel(),
+    }
+    if info["configurado"]:
+        try:
+            pocketbase.testar_auth()
+            info["autenticado"] = True
+        except Exception as erro:
+            info["autenticado"] = False
+            info["auth_erro"] = str(erro)
+        try:
+            colecoes = pocketbase.listar_colecoes().get("items", [])
+            info["colecoes"] = [c.get("name") for c in colecoes]
+        except Exception as erro:
+            info["colecoes_erro"] = str(erro)
+        try:
+            info["products"] = len(pocketbase.listar_todos())
+        except Exception as erro:
+            info["products_erro"] = str(erro)
+        try:
+            info["locations"] = len(pocketbase.localizacoes())
+        except Exception as erro:
+            info["locations_erro"] = str(erro)
+    with _meta_lock:
+        info["ultimo_erro"] = _meta_cache.get("erro")
+    if not info["configurado"]:
+        info["ultimo_erro"] = "PocketBase não configurado (POCKETBASE_EMAIL/POCKETBASE_PASSWORD)"
+    return info
+
+
+@app.get("/api/localizacoes")
+def listar_localizacoes(request: Request):
+    _exigir_admin(request)
+    por_id, por_folder, locais_por_id, locais = _dados_pocketbase()
+    contagem = {l["id"]: 0 for l in locais}
+    for slug in CATEGORIAS:
+        for produto in escanear_categoria(slug):
+            _, dados = _registro_do_produto(produto, por_id, por_folder)
+            atual = dados.get("location") or dados.get("address")
+            vistos = set()
+            while atual and atual in locais_por_id and atual not in vistos:
+                contagem[atual] = contagem.get(atual, 0) + 1
+                vistos.add(atual)
+                atual = locais_por_id[atual].get("parent") or ""
+
+    filhos = {}
+    for local in locais:
+        filhos.setdefault(local.get("parent") or "", []).append(local)
+    for lista in filhos.values():
+        lista.sort(key=lambda x: ((x.get("order") or 0), x.get("name") or ""))
+
+    def montar(pai):
+        return [
+            {
+                "id": local["id"],
+                "name": local.get("name") or "",
+                "parent": local.get("parent") or "",
+                "order": local.get("order") or 0,
+                "notes": local.get("notes") or "",
+                "count": contagem.get(local["id"], 0),
+                "children": montar(local["id"]),
+            }
+            for local in filhos.get(pai, [])
+        ]
+
+    with _meta_lock:
+        erro = _meta_cache.get("erro")
+    return {
+        "tree": montar(""),
+        "nodes": locais,
+        "contagens": contagem,
+        "configurado": pocketbase.configurado(),
+        "erro": erro,
+    }
+
+
+@app.post("/api/localizacoes")
+def criar_localizacao(payload: dict, request: Request):
+    _exigir_admin(request)
+    nome = (payload.get("name") or "").strip()
+    if not nome:
+        raise HTTPException(status_code=400, detail="Informe o nome da localização")
+    pai = (payload.get("parent") or "").strip()
+    if pai:
+        try:
+            pocketbase.obter(pai, pocketbase.LOCALIZACOES)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Localização pai não encontrada")
+    try:
+        registro = pocketbase.criar_localizacao({
+            "name": nome,
+            "parent": pai,
+            "order": int(payload.get("order") or 0),
+            "notes": payload.get("notes") or "",
+        })
+    except pocketbase.PocketBaseError as erro:
+        raise _pb_erro(erro)
+    _invalidar_meta()
+    return registro
+
+
+@app.patch("/api/localizacoes/{loc_id}")
+def editar_localizacao(loc_id: str, payload: dict, request: Request):
+    _exigir_admin(request)
+    try:
+        pocketbase.obter(loc_id, pocketbase.LOCALIZACOES)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Localização não encontrada")
+    dados = {}
+    if "name" in payload:
+        nome = (payload.get("name") or "").strip()
+        if not nome:
+            raise HTTPException(status_code=400, detail="Informe o nome da localização")
+        dados["name"] = nome
+    if "parent" in payload:
+        pai = (payload.get("parent") or "").strip()
+        if pai:
+            por_id = {l["id"]: l for l in pocketbase.localizacoes()}
+            if pai not in por_id:
+                raise HTTPException(status_code=400, detail="Localização pai não encontrada")
+            atual = pai
+            vistos = set()
+            while atual:
+                if atual == loc_id:
+                    raise HTTPException(status_code=400, detail="Movimento criaria um ciclo")
+                if atual in vistos:
+                    break
+                vistos.add(atual)
+                atual = (por_id.get(atual) or {}).get("parent") or ""
+        dados["parent"] = pai
+    if "order" in payload:
+        dados["order"] = int(payload.get("order") or 0)
+    if "notes" in payload:
+        dados["notes"] = payload.get("notes") or ""
+    try:
+        registro = pocketbase.atualizar_localizacao(loc_id, dados)
+    except pocketbase.PocketBaseError as erro:
+        raise _pb_erro(erro)
+    _invalidar_meta()
+    return registro
+
+
+@app.delete("/api/localizacoes/{loc_id}")
+def excluir_localizacao(loc_id: str, request: Request):
+    _exigir_admin(request)
+    try:
+        locais = pocketbase.localizacoes()
+    except pocketbase.PocketBaseError as erro:
+        raise _pb_erro(erro)
+    if any((l.get("parent") or "") == loc_id for l in locais):
+        raise HTTPException(status_code=400, detail="Localização tem sublocalizações")
+    por_id, por_folder, _, _ = _dados_pocketbase()
+    for slug in CATEGORIAS:
+        for produto in escanear_categoria(slug):
+            _, dados = _registro_do_produto(produto, por_id, por_folder)
+            if (dados.get("location") or dados.get("address")) == loc_id:
+                raise HTTPException(status_code=400, detail="Localização tem produtos")
+    try:
+        pocketbase.excluir_localizacao(loc_id)
+    except pocketbase.PocketBaseError as erro:
+        raise _pb_erro(erro)
+    _invalidar_meta()
+    return {"ok": True}
+
+
+@app.put("/api/produto/{categoria}/{slug}/meta")
+def salvar_meta(categoria: str, slug: str, payload: dict, request: Request):
+    _exigir_admin(request)
+    if categoria not in CATEGORIAS:
+        raise HTTPException(status_code=404, detail="Categoria não encontrada")
+    produto = next((p for p in escanear_categoria(categoria) if p["slug"] == slug), None)
+    if not produto:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    dados = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(dados, dict):
+        raise HTTPException(status_code=400, detail="Metadados inválidos")
+    dados = dict(dados)
+    if "price" in dados:
+        preco = dados["price"]
+        if preco is not None and (
+            isinstance(preco, bool) or not isinstance(preco, (int, float)) or preco < 0
+        ):
+            raise HTTPException(status_code=400, detail="Preço inválido")
+    loc_id = dados.get("location") or dados.get("address")
+    if not loc_id:
+        raise HTTPException(status_code=400, detail="Informe a localização")
+    try:
+        locais = {l["id"]: l for l in pocketbase.localizacoes()}
+    except pocketbase.PocketBaseError as erro:
+        raise _pb_erro(erro)
+    if loc_id not in locais:
+        raise HTTPException(status_code=400, detail="Localização não encontrada")
+    caminho, raiz_id = _caminho_localizacao(loc_id, locais)
+    if not caminho:
+        raise HTTPException(status_code=400, detail="Localização inválida")
+    dados["address"] = raiz_id
+    dados["location"] = loc_id
+    pasta = BASE_DIR / produto["pasta_relativa"]
+    try:
+        registro = sync_meta.garantir_registro(pasta)
+        atualizado = pocketbase.atualizar(
+            registro["id"],
+            {"folder": produto["pasta_relativa"], "data": dados},
+        )
+    except pocketbase.PocketBaseError as erro:
+        raise _pb_erro(erro)
+    _invalidar_meta()
+    return {"ok": True, "record": atualizado}
+
+
+@app.post("/api/admin/sincronizar")
+def sincronizar_metadados(request: Request):
+    _exigir_admin(request)
+    try:
+        resultado = sync_meta.sincronizar([cfg["dir"] for cfg in CATEGORIAS.values()])
+    except pocketbase.PocketBaseError as erro:
+        raise _pb_erro(erro)
+    _invalidar_meta()
+    return resultado
 
 
 @app.post("/api/login")
@@ -354,8 +682,25 @@ def mover_produto(payload: dict):
     
     origem_rel = str(origem.relative_to(BASE_DIR))
     destino_rel = str(destino_final.relative_to(BASE_DIR))
+    meta_erro = None
+    try:
+        if pocketbase.configurado():
+            meta_id = sync_meta.produto_id(destino_final)
+            if meta_id:
+                pocketbase.atualizar(meta_id, {"folder": destino_rel})
+            else:
+                registro = pocketbase.procurar_produto(origem_rel)
+                if registro:
+                    pocketbase.atualizar(registro["id"], {"folder": destino_rel})
+                    sync_meta.escrever_meta(destino_final, registro["id"])
+            _invalidar_meta()
+    except Exception as erro:
+        meta_erro = str(erro)
     git = git_commit_push(f"Mover anúncio: {origem_rel} -> {destino_rel}")
-    return {"ok": True, "origem": origem_rel, "destino": destino_rel, "git": git}
+    resultado = {"ok": True, "origem": origem_rel, "destino": destino_rel, "git": git}
+    if meta_erro:
+        resultado["meta_erro"] = meta_erro
+    return resultado
 
 
 # ============================================================
@@ -442,6 +787,17 @@ async def adicionar_produto(tipo: str, nome: str, request: Request):
         except OSError:
             pass
 
+    try:
+        if pocketbase.configurado():
+            registro = pocketbase.criar({
+                "folder": resultado["destino"],
+                "data": {"price": None},
+            })
+            sync_meta.escrever_meta(destino, registro["id"])
+            resultado["meta_id"] = registro["id"]
+            _invalidar_meta()
+    except Exception as erro:
+        resultado["meta_erro"] = str(erro)
     git = git_commit_push(f"Adicionar anúncio: {resultado['destino']}")
     resultado["git"] = git
     return resultado
@@ -461,10 +817,24 @@ def excluir_produto(payload: dict, request: Request):
         raise HTTPException(status_code=400, detail="Caminho inválido")
     if not alvo.is_dir():
         raise HTTPException(status_code=404, detail="Pasta não encontrada")
-    shutil.rmtree(alvo)
+    meta_id = sync_meta.produto_id(alvo)
     removido = str(alvo.relative_to(BASE_DIR.resolve()))
+    shutil.rmtree(alvo)
+    resultado = {"ok": True, "removido": removido}
+    try:
+        if pocketbase.configurado():
+            if meta_id:
+                pocketbase.excluir(meta_id)
+            else:
+                registro = pocketbase.procurar_produto(removido)
+                if registro:
+                    pocketbase.excluir(registro["id"])
+            _invalidar_meta()
+    except Exception as erro:
+        resultado["meta_erro"] = str(erro)
     git = git_commit_push(f"Excluir anúncio: {removido}")
-    return {"ok": True, "removido": removido, "git": git}
+    resultado["git"] = git
+    return resultado
 
 
 # ============================================================
@@ -553,6 +923,45 @@ nav button.active { color: var(--accent); border-color: var(--accent);
 .badge-fabricado { background: rgba(124,58,237,0.15); color: #a78bfa; }
 .badge-revenda { background: rgba(245,158,11,0.15); color: #fbbf24; }
 .badge-sold { background: rgba(239,68,68,0.15); color: var(--danger); }
+.card-price { font-size: 1.05rem; font-weight: 800; color: var(--accent); margin-bottom: 0.35rem; }
+.location-breadcrumb { font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.5rem; line-height: 1.4; }
+.location-breadcrumb b { color: #fbbf24; font-weight: 600; }
+.loc-layout { display: grid; grid-template-columns: 300px 1fr; gap: 1.5rem; align-items: start; }
+.loc-sidebar { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; }
+.loc-list { list-style: none; margin: 0; padding: 0; }
+.loc-node { display: flex; justify-content: space-between; gap: 0.5rem; width: 100%;
+  text-align: left; background: none; border: none; color: var(--text-muted);
+  padding: 0.35rem 0.4rem; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 0.85rem; }
+.loc-node:hover { background: var(--surface-hover); color: var(--text); }
+.loc-node.active { background: rgba(0,212,170,0.12); color: var(--accent); }
+.loc-count { color: var(--text-muted); font-size: 0.72rem; }
+.loc-main { min-width: 0; }
+.loc-breadcrumb { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center;
+  font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem; }
+.loc-breadcrumb button { background: none; border: none; color: var(--accent); cursor: pointer;
+  font-family: inherit; font-size: 0.85rem; padding: 0; }
+.loc-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.2rem; align-items: center; }
+.loc-actions select { padding: 0.4rem 0.6rem; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); font-family: inherit; }
+.btn-ghost { padding: 0.4rem 0.7rem; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text-muted); cursor: pointer; font-family: inherit;
+  font-size: 0.75rem; font-weight: 600; }
+.btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+.btn-ghost.danger:hover { border-color: var(--danger); color: var(--danger); }
+.loc-empty { color: var(--text-muted); font-size: 0.85rem; }
+.loc-erro { background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.45);
+  color: #fca5a5; padding: 0.8rem 1rem; border-radius: 8px; margin-bottom: 1rem;
+  font-size: 0.85rem; white-space: pre-wrap; }
+.card-admin { display: flex; flex-direction: column; gap: 0.3rem; margin-bottom: 0.6rem; }
+.card-admin label { font-size: 0.66rem; color: var(--text-muted); text-transform: uppercase;
+  letter-spacing: 0.04em; margin-top: 0.25rem; }
+.card-price-input, .card-local-select { width: 100%; padding: 0.45rem 0.6rem; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  font-family: inherit; font-size: 0.85rem; }
+.card-price-input:focus, .card-local-select:focus { outline: none; border-color: var(--accent); }
+.edit-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 1rem;
+  padding-top: 0.8rem; border-top: 1px solid var(--border); }
+@media (max-width: 768px) { .loc-layout { grid-template-columns: 1fr; } }
 .card-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: auto;
   padding-top: 0.8rem; border-top: 1px solid var(--border); }
 .btn-action { padding: 0.4rem 0.7rem; border-radius: 6px; font-size: 0.72rem;
@@ -656,10 +1065,12 @@ nav button.desbloqueado .lock { color: var(--accent); }
 .add-box h3, .add-box p { text-align: center; }
 .add-box label { display: block; font-size: 0.8rem; color: var(--text-muted);
   margin: 0.7rem 0 0.3rem; }
-.add-box select, .add-box input[type=text], .add-box input[type=file] {
+.add-box select, .add-box input[type=text], .add-box input[type=file],
+.add-box input[type=number], .add-box textarea {
   width: 100%; padding: 0.7rem; border-radius: 8px; border: 1px solid var(--border);
   background: var(--bg); color: var(--text); font-family: inherit; font-size: 0.9rem; }
-.add-box select:focus, .add-box input:focus { outline: none; border-color: var(--accent); }
+.add-box select:focus, .add-box input:focus, .add-box textarea:focus {
+  outline: none; border-color: var(--accent); }
 .add-box .pw-actions { margin-top: 1.2rem; }
 
 /* Cabeçalho: título + botão adicionar */
@@ -686,6 +1097,10 @@ JS = r"""
 let produtos = [];
 let categoriaAtiva = 'classificados';
 let autenticado = false;
+let localizacoes = [];
+let localSelecionada = null;
+let editAtual = null;
+let localErro = '';
 
 // ===== WHATSAPP =====
 const WHATSAPP_NUM = '5515976044496';
@@ -701,17 +1116,57 @@ function esc(s) {
     .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function fmtPreco(valor) {
+  if (valor === null || valor === undefined || valor === '') return 'Sob consulta';
+  const n = Number(valor);
+  if (isNaN(n)) return 'Sob consulta';
+  return n.toLocaleString('pt-BR', {style: 'currency', currency: 'BRL'});
+}
+
+function achatarLocalizacoes(nodes) {
+  const lista = [];
+  const visitar = (arr) => (arr || []).forEach(n => { lista.push(n); visitar(n.children); });
+  visitar(nodes);
+  return lista;
+}
+
+async function carregarLocalizacoes() {
+  localErro = '';
+  if (!autenticado) { localizacoes = []; return; }
+  try {
+    const res = await fetch('/api/localizacoes');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      localizacoes = [];
+      localErro = data.detail || 'Erro ao carregar localizações';
+      return;
+    }
+    localizacoes = data.tree || [];
+    localErro = data.erro || '';
+  } catch (e) {
+    localizacoes = [];
+    localErro = 'Erro de conexão ao carregar localizações';
+  }
+}
+
 async function carregarProdutos() {
   const res = await fetch('/api/produtos');
   const data = await res.json();
   produtos = data.produtos;
   autenticado = data.autenticado;
+  if (autenticado) {
+    await carregarLocalizacoes();
+  } else {
+    localizacoes = [];
+  }
   atualizarNav();
   renderizar();
 }
 
 function atualizarNav() {
   const btnSold = document.getElementById('btn-sold');
+  const btnLoc = document.getElementById('btn-localizacoes');
+  if (btnLoc) btnLoc.style.display = autenticado ? 'inline-block' : 'none';
   if (autenticado) {
     btnSold.classList.add('desbloqueado');
     btnSold.innerHTML = 'Vendidos 🔓';
@@ -755,13 +1210,12 @@ function renderizar() {
 function renderCard(p) {
   const imgUrl = `/imagem/${p.categoria}/${p.slug}/${encodeURIComponent(p.imagem_capa)}?v=${p.versao}`;
   const botoes = [];
-  
+  const locTxt = [p.address, ...(p.location || [])].filter(Boolean).join(' › ');
+  const opcoesLoc = autenticado ? opcoesLocalizacao(p.location_id || '') : '';
+
   if (autenticado) {
-    if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
-    if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
-    if (p.categoria !== 'revenda') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-revenda')">→ Revenda</button>`);
+    botoes.push(`<button class="btn-action" onclick="abrirEditar(event, '${p.categoria}', '${p.slug}')">✎ Editar</button>`);
     if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
-    botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
   }
 
   return `
@@ -772,6 +1226,17 @@ function renderCard(p) {
   </div>
   <div class="card-body">
     <div class="card-title">${p.nome}</div>
+    ${autenticado ? `
+    <div class="card-admin" onclick="event.stopPropagation()">
+      <label>Preço</label>
+      <input type="number" step="0.01" min="0" class="card-price-input" value="${p.price ?? ''}" placeholder="Sob consulta" onchange="salvarPrecoCard(event, '${p.categoria}', '${p.slug}')">
+      <label>Localização</label>
+      <select class="card-local-select" onchange="salvarLocalCard(event, '${p.categoria}', '${p.slug}')">
+        ${opcoesLoc}
+      </select>
+      <div class="location-breadcrumb">📍 <b>${locTxt ? esc(locTxt) : 'Sem localização'}</b></div>
+    </div>` : `
+    <div class="card-price">${fmtPreco(p.price)}</div>`}
     <div class="card-meta">
       <span class="badge badge-${p.categoria}">${p.categoria_nome}</span>
     </div>
@@ -792,12 +1257,10 @@ function abrirDetalhe(categoria, slug) {
   ).join('');
 
   const botoes = [];
+  const locTxt = [p.address, ...(p.location || [])].filter(Boolean).join(' › ');
   if (autenticado) {
-    if (p.categoria !== 'classificados') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-classificados')">→ Classificado</button>`);
-    if (p.categoria !== 'fabricado') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-fabricado')">→ Fabricado</button>`);
-    if (p.categoria !== 'revenda') botoes.push(`<button class="btn-action" onclick="mover(event, '${p.pasta_relativa}', 'ads-revenda')">→ Revenda</button>`);
+    botoes.push(`<button class="btn-action" onclick="abrirEditar(event, '${p.categoria}', '${p.slug}')">✎ Editar</button>`);
     if (p.categoria !== 'sold') botoes.push(`<button class="btn-action danger" onclick="mover(event, '${p.pasta_relativa}', 'ads-sold/vendido')">✓ Vender</button>`);
-    botoes.push(`<button class="btn-action excluir" data-excluir="${esc(p.pasta_relativa)}" data-nome="${esc(p.nome)}">🗑 Excluir</button>`);
   }
 
   const desc = p.descricao ? `<pre>${p.descricao}</pre>` : '<p class="desc-text" style="color: var(--text-muted)">Sem descrição detalhada.</p>';
@@ -807,10 +1270,12 @@ function abrirDetalhe(categoria, slug) {
   <a href="#" class="detail-back" onclick="renderizar(); return false;">← Voltar ao catálogo</a>
   <div class="detail-header">
     <h1 class="detail-title">${p.nome}</h1>
+    <div class="card-price" style="font-size:1.4rem;">${fmtPreco(p.price)}</div>
     <div class="detail-badges">
       <span class="badge badge-${p.categoria}">${p.categoria_nome}</span>
       <span class="badge" style="background: var(--surface); color: var(--text-muted);">${p.imagens.length} foto${p.imagens.length>1?'s':''}</span>
     </div>
+    ${locTxt ? `<div class="location-breadcrumb" style="margin-top:0.6rem;">📍 <b>${esc(locTxt)}</b></div>` : ''}
   </div>
   <div class="gallery">${imagens}</div>
   <div class="detail-info"><h3>Descrição</h3>${desc}</div>
@@ -819,6 +1284,440 @@ function abrirDetalhe(categoria, slug) {
 </div>`;
 
   bindLightbox();
+}
+
+async function salvarMetaCard(categoria, slug, dados, mensagem) {
+  try {
+    const res = await fetch(`/api/produto/${categoria}/${slug}/meta`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({data: dados})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Erro ao salvar');
+    showToast(mensagem || '✓ Salvo');
+    await recarregarMantendoVisao();
+  } catch (e) {
+    showToast(e.message || 'Erro ao salvar', true);
+  }
+}
+
+async function salvarPrecoCard(event, categoria, slug) {
+  event.stopPropagation();
+  const p = produtos.find(x => x.categoria === categoria && x.slug === slug);
+  if (!p) return;
+  const txt = event.target.value.trim();
+  const preco = txt === '' ? null : Number(txt);
+  if (preco !== null && (isNaN(preco) || preco < 0)) {
+    showToast('Preço inválido', true);
+    event.target.value = p.price ?? '';
+    return;
+  }
+  if (!p.location_id) {
+    showToast('Escolha a localização antes de salvar o preço', true);
+    event.target.value = p.price ?? '';
+    return;
+  }
+  const dados = Object.assign({}, p.meta || {}, {price: preco, location: p.location_id});
+  await salvarMetaCard(categoria, slug, dados, '✓ Preço atualizado');
+}
+
+async function salvarLocalCard(event, categoria, slug) {
+  event.stopPropagation();
+  const p = produtos.find(x => x.categoria === categoria && x.slug === slug);
+  if (!p) return;
+  const loc = event.target.value;
+  if (!loc) {
+    showToast('Escolha uma localização', true);
+    return;
+  }
+  const dados = Object.assign({}, p.meta || {}, {location: loc});
+  await salvarMetaCard(categoria, slug, dados, '✓ Localização atualizada');
+}
+
+function opcoesLocalizacao(selecionado) {
+  const {flat, porId} = mapaLocalizacoes();
+  const opcoes = ['<option value="">Sem localização</option>'];
+  flat.forEach(n => {
+    const caminho = caminhoLocal(n.id, porId).map(x => x.name).join(' › ');
+    const sel = n.id === selecionado ? ' selected' : '';
+    opcoes.push(`<option value="${n.id}"${sel}>${esc(caminho)}</option>`);
+  });
+  return opcoes.join('');
+}
+
+async function abrirEditar(event, categoria, slug) {
+  event.stopPropagation();
+  if (!autenticado) return;
+  const p = produtos.find(x => x.categoria === categoria && x.slug === slug);
+  if (!p) return;
+  editAtual = p;
+  await carregarLocalizacoes();
+  document.getElementById('edit-titulo').textContent = 'Editar: ' + p.nome;
+  document.getElementById('edit-preco').value = (p.price === null || p.price === undefined) ? '' : p.price;
+  document.getElementById('edit-local').innerHTML = opcoesLocalizacao(p.location_id || '');
+  atualizarCaminhoEdit();
+  const extras = Object.assign({}, p.meta || {});
+  delete extras.price;
+  delete extras.address;
+  delete extras.location;
+  document.getElementById('edit-extras').value = Object.keys(extras).length ? JSON.stringify(extras, null, 2) : '';
+  const acoes = [];
+  if (p.categoria !== 'classificados') acoes.push(`<button class="btn-action" onclick="moverEditar('ads-classificados')">→ Classificado</button>`);
+  if (p.categoria !== 'fabricado') acoes.push(`<button class="btn-action" onclick="moverEditar('ads-fabricado')">→ Fabricado</button>`);
+  if (p.categoria !== 'revenda') acoes.push(`<button class="btn-action" onclick="moverEditar('ads-revenda')">→ Revenda</button>`);
+  acoes.push(`<button class="btn-action excluir" onclick="excluirDoEditar()">🗑 Excluir</button>`);
+  document.getElementById('edit-acoes').innerHTML = acoes.join('');
+  document.getElementById('edit-erro').style.display = 'none';
+  document.getElementById('edit-overlay').classList.add('active');
+}
+
+function fecharEditar() {
+  document.getElementById('edit-overlay').classList.remove('active');
+}
+
+async function moverEditar(destino) {
+  if (!editAtual) return;
+  const origem = editAtual.pasta_relativa;
+  try {
+    const res = await fetch('/api/mover', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({origem, destino})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!data.ok) throw new Error(data.detail || 'Erro ao mover');
+    fecharEditar();
+    showToast('✓ Item movido' + gitResumo(data.git));
+    await recarregarMantendoVisao();
+  } catch (e) {
+    const erro = document.getElementById('edit-erro');
+    erro.textContent = e.message || 'Erro ao mover';
+    erro.style.display = 'block';
+  }
+}
+
+function excluirDoEditar() {
+  if (!editAtual) return;
+  const pasta = editAtual.pasta_relativa;
+  const nome = editAtual.nome;
+  fecharEditar();
+  excluirProduto(pasta, nome);
+}
+
+async function salvarEditar() {
+  const erro = document.getElementById('edit-erro');
+  const btn = document.getElementById('edit-salvar');
+  const precoTxt = document.getElementById('edit-preco').value.trim();
+  const preco = precoTxt === '' ? null : Number(precoTxt);
+  if (preco !== null && (isNaN(preco) || preco < 0)) {
+    erro.textContent = 'Preço inválido.';
+    erro.style.display = 'block';
+    return;
+  }
+  const loc = document.getElementById('edit-local').value;
+  if (!loc) {
+    erro.textContent = 'Escolha a localização (endereço obrigatório).';
+    erro.style.display = 'block';
+    return;
+  }
+  let extras = {};
+  const txt = document.getElementById('edit-extras').value.trim();
+  if (txt) {
+    try {
+      extras = JSON.parse(txt);
+    } catch (e) {
+      erro.textContent = 'JSON inválido nos campos extras.';
+      erro.style.display = 'block';
+      return;
+    }
+    if (extras === null || typeof extras !== 'object' || Array.isArray(extras)) {
+      erro.textContent = 'Os campos extras precisam ser um objeto JSON.';
+      erro.style.display = 'block';
+      return;
+    }
+  }
+  const dados = Object.assign({}, extras, {price: preco, location: loc});
+  erro.style.display = 'none';
+  btn.disabled = true;
+  const rotulo = btn.textContent;
+  btn.textContent = 'Salvando...';
+  try {
+    const res = await fetch(`/api/produto/${editAtual.categoria}/${editAtual.slug}/meta`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({data: dados})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Erro ao salvar');
+    fecharEditar();
+    showToast('✓ Metadados salvos');
+    await recarregarMantendoVisao();
+  } catch (e) {
+    erro.textContent = e.message || 'Erro ao salvar.';
+    erro.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = rotulo;
+  }
+}
+
+function mapaLocalizacoes() {
+  const flat = achatarLocalizacoes(localizacoes);
+  const porId = {};
+  flat.forEach(n => { porId[n.id] = n; });
+  return {flat, porId};
+}
+
+function caminhoLocal(id, porId) {
+  const partes = [];
+  let atual = porId[id];
+  const vistos = new Set();
+  while (atual && !vistos.has(atual.id)) {
+    vistos.add(atual.id);
+    partes.push(atual);
+    atual = porId[atual.parent];
+  }
+  return partes.reverse();
+}
+
+function caminhoTextoLocal(id) {
+  if (!id) return '';
+  const {porId} = mapaLocalizacoes();
+  return caminhoLocal(id, porId).map(x => x.name).join(' › ');
+}
+
+function atualizarCaminhoEdit() {
+  const alvo = document.getElementById('edit-local-path');
+  if (!alvo) return;
+  const id = document.getElementById('edit-local').value;
+  alvo.innerHTML = id
+    ? `📍 <b>${esc(caminhoTextoLocal(id))}</b>`
+    : '<span>Sem localização</span>';
+}
+
+function descendentesLocal(id, porId) {
+  const ids = new Set([id]);
+  const visitar = (atual) => (atual.children || []).forEach(f => { ids.add(f.id); visitar(f); });
+  if (porId[id]) visitar(porId[id]);
+  return ids;
+}
+
+function renderArvoreLocais(nodes, nivel) {
+  return `<ul class="loc-list">` + (nodes || []).map(n => `
+    <li>
+      <button class="loc-node ${localSelecionada === n.id ? 'active' : ''}" onclick="selecionarLocal('${n.id}')">
+        <span>${'\u00a0\u00a0'.repeat(nivel)}${esc(n.name)}</span>
+        <span class="loc-count">${n.count || 0}</span>
+      </button>
+      ${n.children && n.children.length ? renderArvoreLocais(n.children, nivel + 1) : ''}
+    </li>`).join('') + `</ul>`;
+}
+
+function renderLocalizacoes() {
+  const app = document.getElementById('app');
+  const {flat, porId} = mapaLocalizacoes();
+  if (!localizacoes.length) {
+    app.innerHTML = `
+      <a href="#" class="detail-back" onclick="setCategoria('classificados'); return false;">← Voltar ao catálogo</a>
+      ${localErro ? `<div class="loc-erro">⚠ ${esc(localErro)}</div>` : ''}
+      <h2 class="section-title">Localizações</h2>
+      <p class="loc-empty">Nenhuma localização cadastrada ainda.</p>
+      <div class="loc-actions">
+        <button class="btn-ghost" onclick="novaLocal('')">+ Criar endereço</button>
+        <button class="btn-ghost" onclick="verificarPocketbase()">Testar conexão</button>
+      </div>`;
+    return;
+  }
+  const selecionado = localSelecionada ? porId[localSelecionada] : null;
+  const caminho = selecionado ? caminhoLocal(selecionado.id, porId) : [];
+  const ids = selecionado ? descendentesLocal(selecionado.id, porId) : new Set();
+  const listaProdutos = selecionado ? produtos.filter(p => p.location_id && ids.has(p.location_id)) : [];
+  const filhosAtuais = selecionado ? (selecionado.children || []) : localizacoes;
+  const bloqueados = selecionado ? descendentesLocal(selecionado.id, porId) : new Set();
+  const opcoesPai = flat
+    .filter(n => !bloqueados.has(n.id))
+    .map(n => `<option value="${n.id}">${esc(caminhoLocal(n.id, porId).map(x => x.name).join(' › '))}</option>`)
+    .join('');
+  const breadcrumb = selecionado
+    ? caminho.map((n, i) => `<button onclick="selecionarLocal('${n.id}')">${esc(n.name)}</button>${i < caminho.length - 1 ? '›' : ''}`).join('')
+    : '<span>Selecione um local na árvore</span>';
+  const cards = listaProdutos.map(p => renderCard(p)).join('');
+  const cardsFilhos = filhosAtuais.map(n => `
+    <div class="card" onclick="selecionarLocal('${n.id}')">
+      <div class="card-body">
+        <div class="card-title">${esc(n.name)}</div>
+        <div class="card-meta"><span class="badge">${n.count || 0} item(s)</span></div>
+      </div>
+    </div>`).join('');
+  app.innerHTML = `
+    <a href="#" class="detail-back" onclick="setCategoria('classificados'); return false;">← Voltar ao catálogo</a>
+    ${localErro ? `<div class="loc-erro">⚠ ${esc(localErro)}</div>` : ''}
+    <div class="loc-layout">
+      <aside class="loc-sidebar">
+        <div class="loc-actions">
+          <button class="btn-ghost" onclick="novaLocal('${selecionado ? selecionado.id : ''}')">+ ${selecionado ? 'Sublocal' : 'Endereço'}</button>
+          <button class="btn-ghost" onclick="sincronizarMetadados()">↻ Sincronizar</button>
+          <button class="btn-ghost" onclick="verificarPocketbase()">Testar conexão</button>
+        </div>
+        ${renderArvoreLocais(localizacoes, 0)}
+      </aside>
+      <section class="loc-main">
+        <div class="loc-breadcrumb">${breadcrumb}</div>
+        ${selecionado ? `
+          <div class="loc-actions">
+            <button class="btn-ghost" onclick="renomearLocal('${selecionado.id}')">Renomear</button>
+            ${opcoesPai ? `<select id="loc-mover-destino"><option value="">Mover para...</option>${opcoesPai}</select><button class="btn-ghost" onclick="moverLocal('${selecionado.id}')">Mover</button>` : ''}
+            <button class="btn-ghost danger" onclick="excluirLocal('${selecionado.id}')">Excluir</button>
+          </div>` : ''}
+        ${filhosAtuais.length ? `<h3 class="section-title" style="font-size:1.05rem;margin-top:0;">Sublocais</h3><div class="grid">${cardsFilhos}</div>` : ''}
+        ${selecionado ? `<h3 class="section-title" style="font-size:1.05rem;">Produtos (${listaProdutos.length})</h3>${cards ? `<div class="grid">${cards}</div>` : '<p class="loc-empty">Nenhum produto neste local ou abaixo dele.</p>'}` : ''}
+      </section>
+    </div>`;
+}
+
+async function recarregarMantendoVisao() {
+  const locAtiva = document.getElementById('btn-localizacoes')?.classList.contains('active');
+  await carregarProdutos();
+  if (locAtiva) renderLocalizacoes();
+}
+
+async function atualizarVisaoLocal() {
+  await carregarProdutos();
+  await carregarLocalizacoes();
+  renderLocalizacoes();
+}
+
+async function abrirLocalizacoes() {
+  if (!autenticado) {
+    abrirSenha('Área restrita. Digite a senha.', abrirLocalizacoes);
+    return;
+  }
+  document.querySelectorAll('nav button:not(.btn-logout)').forEach(b => b.classList.remove('active'));
+  document.getElementById('btn-localizacoes').classList.add('active');
+  localSelecionada = null;
+  await carregarProdutos();
+  await carregarLocalizacoes();
+  renderLocalizacoes();
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+function selecionarLocal(id) {
+  localSelecionada = id;
+  renderLocalizacoes();
+}
+
+async function novaLocal(pai) {
+  const nome = prompt(pai ? 'Nome da sublocalização:' : 'Nome do endereço:');
+  if (!nome) return;
+  try {
+    const res = await fetch('/api/localizacoes', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: nome, parent: pai || ''})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Erro ao criar');
+    showToast('✓ Localização criada');
+    await atualizarVisaoLocal();
+  } catch (e) {
+    showToast(e.message || 'Erro ao criar', true);
+  }
+}
+
+async function renomearLocal(id) {
+  const {porId} = mapaLocalizacoes();
+  const atual = porId[id];
+  if (!atual) return;
+  const nome = prompt('Novo nome:', atual.name);
+  if (!nome || nome === atual.name) return;
+  try {
+    const res = await fetch(`/api/localizacoes/${id}`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: nome})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Erro ao renomear');
+    showToast('✓ Localização renomeada');
+    await atualizarVisaoLocal();
+  } catch (e) {
+    showToast(e.message || 'Erro ao renomear', true);
+  }
+}
+
+async function moverLocal(id) {
+  const select = document.getElementById('loc-mover-destino');
+  const destino = select ? select.value : '';
+  if (!destino) {
+    showToast('Escolha o destino', true);
+    return;
+  }
+  try {
+    const res = await fetch(`/api/localizacoes/${id}`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({parent: destino})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Erro ao mover');
+    showToast('✓ Localização movida');
+    await atualizarVisaoLocal();
+  } catch (e) {
+    showToast(e.message || 'Erro ao mover', true);
+  }
+}
+
+async function excluirLocal(id) {
+  if (!confirm('Excluir esta localização?')) return;
+  try {
+    const res = await fetch(`/api/localizacoes/${id}`, {method: 'DELETE'});
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Erro ao excluir');
+    showToast('✓ Localização excluída');
+    localSelecionada = null;
+    await atualizarVisaoLocal();
+  } catch (e) {
+    showToast(e.message || 'Erro ao excluir', true);
+  }
+}
+
+async function sincronizarMetadados() {
+  try {
+    const res = await fetch('/api/admin/sincronizar', {method: 'POST'});
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Erro ao sincronizar');
+    const partes = [];
+    if (data.criados) partes.push(`${data.criados} criado(s)`);
+    if (data.atualizados) partes.push(`${data.atualizados} atualizado(s)`);
+    if (data.duplicados) partes.push(`${data.duplicados} duplicado(s)`);
+    if (data.orfaos && data.orfaos.length) partes.push(`${data.orfaos.length} órfão(s)`);
+    showToast('✓ Sincronizado' + (partes.length ? ': ' + partes.join(', ') : ''));
+    await atualizarVisaoLocal();
+  } catch (e) {
+    showToast(e.message || 'Erro ao sincronizar', true);
+  }
+}
+
+async function verificarPocketbase() {
+  try {
+    const res = await fetch('/api/pocketbase/status');
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(d.detail || 'Erro ao verificar');
+    const partes = [
+      'URL: ' + (d.url || '?'),
+      'configurado: ' + (d.configurado ? 'sim' : 'não'),
+      'health: ' + (d.health ? 'ok' : 'falhou')
+    ];
+    if ('autenticado' in d) partes.push('auth: ' + (d.autenticado ? 'ok' : 'falhou'));
+    if (d.colecoes) partes.push('coleções: ' + d.colecoes.join(', '));
+    if (d.auth_erro) partes.push('erro auth: ' + d.auth_erro);
+    if (d.colecoes_erro) partes.push('erro coleções: ' + d.colecoes_erro);
+    if (d.ultimo_erro) partes.push('último erro: ' + d.ultimo_erro);
+    alert('PocketBase\n\n' + partes.join('\n'));
+  } catch (e) {
+    alert('Erro ao verificar: ' + (e.message || e));
+  }
 }
 
 async function mover(event, origem, destino) {
@@ -1164,6 +2063,7 @@ HTML = f"""<!DOCTYPE html>
     <button id="btn-fabricado" onclick="setCategoria('fabricado')">Fabricados</button>
     <button id="btn-revenda" onclick="setCategoria('revenda')">Revenda</button>
     <button id="btn-sold" onclick="setCategoria('sold')">Vendidos <span class="lock">🔒</span></button>
+    <button id="btn-localizacoes" style="display:none;" onclick="abrirLocalizacoes()">📍 Localização</button>
     <button id="btn-logout" class="btn-logout" style="display:none;margin-left:auto;" onclick="logout()">Sair</button>
   </nav>
 </header>
@@ -1212,6 +2112,26 @@ HTML = f"""<!DOCTYPE html>
   </div>
 </div>
 
+<div class="pw-overlay" id="edit-overlay">
+  <div class="pw-box add-box">
+    <h3 id="edit-titulo">Editar produto</h3>
+    <p>Preço, localização e campos extras.</p>
+    <label>Preço (R$)</label>
+    <input type="number" step="0.01" min="0" id="edit-preco" placeholder="Deixe vazio para sob consulta">
+    <label>Localização</label>
+    <select id="edit-local" onchange="atualizarCaminhoEdit()"></select>
+    <div class="location-breadcrumb" id="edit-local-path"></div>
+    <label>Campos extras (JSON)</label>
+    <textarea id="edit-extras" rows="5" placeholder='{{"cost": 10}}'></textarea>
+    <div class="pw-erro" id="edit-erro"></div>
+    <div class="edit-actions" id="edit-acoes"></div>
+    <div class="pw-actions">
+      <button class="pw-btn-cancelar" onclick="fecharEditar()">Cancelar</button>
+      <button class="pw-btn-entrar" id="edit-salvar" onclick="salvarEditar()">Salvar</button>
+    </div>
+  </div>
+</div>
+
 <script>{JS}</script>
 </body>
 </html>"""
@@ -1219,6 +2139,26 @@ HTML = f"""<!DOCTYPE html>
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(content=HTML, headers={"Cache-Control": "no-cache"})
+
+
+def _sync_inicial():
+    time.sleep(2)
+    if os.environ.get("POCKETBASE_AUTOSETUP", "1").lower() in ("1", "true", "yes", "sim", ""):
+        try:
+            setup_pocketbase.setup()
+        except Exception as erro:
+            print(f"[setup] {erro}", flush=True)
+    try:
+        resultado = sync_meta.sincronizar([cfg['dir'] for cfg in CATEGORIAS.values()])
+        print(f"[sync] {resultado}", flush=True)
+    except Exception as erro:
+        print(f"[sync] {erro}", flush=True)
+
+
+@app.on_event("startup")
+def _iniciar_sync():
+    if os.environ.get("POCKETBASE_AUTOSYNC", "1").lower() in ("1", "true", "yes", "sim", ""):
+        threading.Thread(target=_sync_inicial, daemon=True).start()
 
 
 # ============================================================
