@@ -28,7 +28,7 @@ except ImportError:
     print("Erro: Pillow não instalado. Rode: pip install Pillow")
     sys.exit(1)
 
-REPOS = ['ads-classificados', 'ads-fabricado', 'ads-sold']
+REPOS = ['ads-classificados', 'ads-fabricado', 'ads-revenda', 'ads-sold']
 IMG_EXT = {'.jpg', '.jpeg'}          # só JPEG
 VID_EXT = {'.mp4', '.mov'}
 LIMIAR = 500 * 1024                   # 500 KB
